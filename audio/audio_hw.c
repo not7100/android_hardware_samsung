@@ -2,6 +2,7 @@
  * Copyright (C) 2013 The Android Open Source Project
  * Copyright (C) 2017 Christopher N. Hesse <raymanfx@gmail.com>
  * Copyright (C) 2017 Andreas Schneider <asn@cryptomilk.org>
+ * Copyright (C) 2018 The LineageOS Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -186,26 +187,6 @@ static struct pcm_device_profile pcm_device_capture_sco = {
     .devices = AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET,
 };
 
-#ifdef SOUND_CAPTURE_HOTWORD_DEVICE
-static struct pcm_device_profile pcm_device_hotword_streaming = {
-    .config = {
-        .channels = 1,
-        .rate = 16000,
-        .period_size = CAPTURE_PERIOD_SIZE,
-        .period_count = CAPTURE_PERIOD_COUNT,
-        .format = PCM_FORMAT_S16_LE,
-        .start_threshold = CAPTURE_START_THRESHOLD,
-        .stop_threshold = 0,
-        .silence_threshold = 0,
-        .avail_min = 0,
-    },
-    .card = SOUND_CARD,
-    .id = SOUND_CAPTURE_HOTWORD_DEVICE,
-    .type = PCM_HOTWORD_STREAMING,
-    .devices = AUDIO_DEVICE_IN_BUILTIN_MIC|AUDIO_DEVICE_IN_WIRED_HEADSET|AUDIO_DEVICE_IN_BACK_MIC
-};
-#endif
-
 static struct pcm_device_profile * const pcm_devices[] = {
     &pcm_device_playback,
     &pcm_device_capture,
@@ -214,9 +195,6 @@ static struct pcm_device_profile * const pcm_devices[] = {
     &pcm_device_capture_sco,
 #ifdef SOUND_CAPTURE_LOOPBACK_AEC_DEVICE
     &pcm_device_capture_loopback_aec,
-#endif
-#ifdef SOUND_CAPTURE_HOTWORD_DEVICE
-    &pcm_device_hotword_streaming,
 #endif
     NULL,
 };
@@ -227,7 +205,6 @@ static const char * const use_case_table[AUDIO_USECASE_MAX] = {
     [USECASE_AUDIO_PLAYBACK_OFFLOAD] = "compress-offload-playback",
     [USECASE_AUDIO_PLAYBACK_DEEP_BUFFER] = "playback deep-buffer",
     [USECASE_AUDIO_CAPTURE] = "capture",
-    [USECASE_AUDIO_CAPTURE_HOTWORD] = "capture-hotword",
     [USECASE_VOICE_CALL] = "voice-call",
 };
 
@@ -919,8 +896,7 @@ static int64_t render_latency(audio_usecase_t usecase)
 
 static int enable_snd_device(struct audio_device *adev,
                              struct audio_usecase *uc_info,
-                             snd_device_t snd_device,
-                             bool update_mixer)
+                             snd_device_t snd_device)
 {
     struct mixer_card *mixer_card;
     struct listnode *node;
@@ -935,8 +911,8 @@ static int enable_snd_device(struct audio_device *adev,
 
     if (snd_device == SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES) {
         ALOGV("Request to enable combo device: enable individual devices\n");
-        enable_snd_device(adev, uc_info, SND_DEVICE_OUT_SPEAKER, update_mixer);
-        enable_snd_device(adev, uc_info, SND_DEVICE_OUT_HEADPHONES, update_mixer);
+        enable_snd_device(adev, uc_info, SND_DEVICE_OUT_SPEAKER);
+        enable_snd_device(adev, uc_info, SND_DEVICE_OUT_HEADPHONES);
         return 0;
     }
     adev->snd_dev_ref_cnt[snd_device]++;
@@ -964,15 +940,11 @@ static int enable_snd_device(struct audio_device *adev,
                 usleep(DSP_POWEROFF_DELAY - elapsed_usec);
             }
         }
-        update_mixer = true;
 #endif /* DSP_POWEROFF_DELAY */
 
         amplifier_enable_devices(snd_device, true);
 
-        audio_route_apply_path(mixer_card->audio_route, snd_device_name);
-        if (update_mixer) {
-            audio_route_update_mixer(mixer_card->audio_route);
-        }
+        audio_route_apply_and_update_path(mixer_card->audio_route, snd_device_name);
     }
 
     return 0;
@@ -980,8 +952,7 @@ static int enable_snd_device(struct audio_device *adev,
 
 int disable_snd_device(struct audio_device *adev,
                               struct audio_usecase *uc_info,
-                              snd_device_t snd_device,
-                              bool update_mixer)
+                              snd_device_t snd_device)
 {
     struct mixer_card *mixer_card;
     struct listnode *node;
@@ -994,8 +965,8 @@ int disable_snd_device(struct audio_device *adev,
 
     if (snd_device == SND_DEVICE_OUT_SPEAKER_AND_HEADPHONES) {
         ALOGV("Request to disable combo device: disable individual devices\n");
-        disable_snd_device(adev, uc_info, SND_DEVICE_OUT_SPEAKER, update_mixer);
-        disable_snd_device(adev, uc_info, SND_DEVICE_OUT_HEADPHONES, update_mixer);
+        disable_snd_device(adev, uc_info, SND_DEVICE_OUT_SPEAKER);
+        disable_snd_device(adev, uc_info, SND_DEVICE_OUT_HEADPHONES);
         return 0;
     }
 
@@ -1009,10 +980,7 @@ int disable_snd_device(struct audio_device *adev,
               snd_device, snd_device_name);
         list_for_each(node, &uc_info->mixer_list) {
             mixer_card = node_to_item(node, struct mixer_card, uc_list_node[uc_info->id]);
-#ifdef DSP_POWEROFF_DELAY
-            update_mixer = true;
-#endif /* DSP_POWEROFF_DELAY */
-            audio_route_reset_path(mixer_card->audio_route, snd_device_name);
+            audio_route_reset_and_update_path(mixer_card->audio_route, snd_device_name);
             if (snd_device > SND_DEVICE_IN_BEGIN && out_uc_info != NULL) {
                 /*
                  * Cycle the rx device to eliminate routing conflicts.
@@ -1020,11 +988,7 @@ int disable_snd_device(struct audio_device *adev,
                  * route.
                  */
                 out_snd_device_name = get_snd_device_name(out_uc_info->out_snd_device);
-                audio_route_apply_path(mixer_card->audio_route, out_snd_device_name);
-                update_mixer = true;
-            }
-            if (update_mixer) {
-                audio_route_update_mixer(mixer_card->audio_route);
+                audio_route_apply_and_update_path(mixer_card->audio_route, out_snd_device_name);
             }
 
             amplifier_enable_devices(snd_device, false);
@@ -1043,15 +1007,10 @@ static int select_devices(struct audio_device *adev,
     snd_device_t in_snd_device = SND_DEVICE_NONE;
     struct audio_usecase *usecase = NULL;
     struct audio_usecase *vc_usecase = NULL;
-    struct listnode *node;
     struct stream_in *active_input = NULL;
     struct stream_out *active_out;
-    struct mixer_card *mixer_card;
 
     ALOGV("%s: usecase(%d)", __func__, uc_id);
-
-    if (uc_id == USECASE_AUDIO_CAPTURE_HOTWORD)
-        return 0;
 
     usecase = get_usecase_from_type(adev, PCM_CAPTURE|VOICE_CALL);
     if (usecase != NULL) {
@@ -1126,11 +1085,11 @@ static int select_devices(struct audio_device *adev,
 
     /* Disable current sound devices */
     if (usecase->out_snd_device != SND_DEVICE_NONE) {
-        disable_snd_device(adev, usecase, usecase->out_snd_device, false);
+        disable_snd_device(adev, usecase, usecase->out_snd_device);
     }
 
     if (usecase->in_snd_device != SND_DEVICE_NONE) {
-        disable_snd_device(adev, usecase, usecase->in_snd_device, false);
+        disable_snd_device(adev, usecase, usecase->in_snd_device);
     }
 
     /* Enable new sound devices */
@@ -1140,16 +1099,11 @@ static int select_devices(struct audio_device *adev,
             set_voice_session_audio_path(adev->voice.session);
         }
 
-        enable_snd_device(adev, usecase, out_snd_device, false);
+        enable_snd_device(adev, usecase, out_snd_device);
     }
 
     if (in_snd_device != SND_DEVICE_NONE) {
-        enable_snd_device(adev, usecase, in_snd_device, false);
-    }
-
-    list_for_each(node, &usecase->mixer_list) {
-         mixer_card = node_to_item(node, struct mixer_card, uc_list_node[usecase->id]);
-         audio_route_update_mixer(mixer_card->audio_route);
+        enable_snd_device(adev, usecase, in_snd_device);
     }
 
     usecase->in_snd_device = in_snd_device;
@@ -2166,7 +2120,7 @@ static int stop_input_stream(struct stream_in *in)
     }
 
     /* Disable the tx device */
-    disable_snd_device(adev, uc_info, uc_info->in_snd_device, true);
+    disable_snd_device(adev, uc_info, uc_info->in_snd_device);
 
     list_remove(&uc_info->adev_list_node);
     free(uc_info);
@@ -2312,32 +2266,15 @@ static int start_input_stream(struct stream_in *in)
           pcm_device->pcm_profile->config.channels,pcm_device->pcm_profile->config.rate,
           pcm_device->pcm_profile->config.format, pcm_device->pcm_profile->config.period_size);
 
-    if (pcm_profile->type == PCM_HOTWORD_STREAMING) {
-        if (!adev->sound_trigger_open_for_streaming) {
-            ALOGE("%s: No handle to sound trigger HAL", __func__);
-            ret = -EIO;
-            goto error_open;
-        }
-        pcm_device->pcm = NULL;
-        pcm_device->sound_trigger_handle = adev->sound_trigger_open_for_streaming();
-        if (pcm_device->sound_trigger_handle <= 0) {
-            ALOGE("%s: Failed to open DSP for streaming", __func__);
-            ret = -EIO;
-            goto error_open;
-        }
-        ALOGV("Opened DSP successfully");
-    } else {
-        pcm_device->sound_trigger_handle = 0;
-        pcm_device->pcm = pcm_open(pcm_device->pcm_profile->card, pcm_device->pcm_profile->id,
+    pcm_device->pcm = pcm_open(pcm_device->pcm_profile->card, pcm_device->pcm_profile->id,
                                    PCM_IN | PCM_MONOTONIC, &pcm_device->pcm_profile->config);
 
-        if (pcm_device->pcm && !pcm_is_ready(pcm_device->pcm)) {
-            ALOGE("%s: %s", __func__, pcm_get_error(pcm_device->pcm));
-            pcm_close(pcm_device->pcm);
-            pcm_device->pcm = NULL;
-            ret = -EIO;
-            goto error_open;
-        }
+    if (pcm_device->pcm && !pcm_is_ready(pcm_device->pcm)) {
+        ALOGE("%s: %s", __func__, pcm_get_error(pcm_device->pcm));
+        pcm_close(pcm_device->pcm);
+        pcm_device->pcm = NULL;
+        ret = -EIO;
+        goto error_open;
     }
 
 skip_pcm_handling:
@@ -2434,14 +2371,9 @@ static int out_close_pcm_devices(struct stream_out *out)
 {
     struct pcm_device *pcm_device;
     struct listnode *node;
-    struct audio_device *adev = out->dev;
 
     list_for_each(node, &out->pcm_dev_list) {
         pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
-        if (pcm_device->sound_trigger_handle > 0) {
-            adev->sound_trigger_close_for_streaming(pcm_device->sound_trigger_handle);
-            pcm_device->sound_trigger_handle = 0;
-        }
         if (pcm_device->pcm) {
             pcm_close(pcm_device->pcm);
             pcm_device->pcm = NULL;
@@ -2529,7 +2461,7 @@ int disable_output_path_l(struct stream_out *out)
              __func__, out->usecase);
         return -EINVAL;
     }
-    disable_snd_device(adev, uc_info, uc_info->out_snd_device, true);
+    disable_snd_device(adev, uc_info, uc_info->out_snd_device);
     uc_release_pcm_devices(uc_info);
     list_remove(&uc_info->adev_list_node);
     free(uc_info);
@@ -2642,8 +2574,8 @@ int stop_voice_call(struct audio_device *adev)
         return -EINVAL;
     }
 
-    disable_snd_device(adev, uc_info, uc_info->out_snd_device, false);
-    disable_snd_device(adev, uc_info, uc_info->in_snd_device, true);
+    disable_snd_device(adev, uc_info, uc_info->out_snd_device);
+    disable_snd_device(adev, uc_info, uc_info->in_snd_device);
 
     list_remove(&uc_info->adev_list_node);
     free(uc_info);
@@ -3473,7 +3405,6 @@ static int in_close_pcm_devices(struct stream_in *in)
 {
     struct pcm_device *pcm_device;
     struct listnode *node;
-    struct audio_device *adev = in->dev;
 
     list_for_each(node, &in->pcm_dev_list) {
         pcm_device = node_to_item(node, struct pcm_device, stream_list_node);
@@ -3481,9 +3412,6 @@ static int in_close_pcm_devices(struct stream_in *in)
             if (pcm_device->pcm)
                 pcm_close(pcm_device->pcm);
             pcm_device->pcm = NULL;
-            if (pcm_device->sound_trigger_handle > 0)
-                adev->sound_trigger_close_for_streaming(pcm_device->sound_trigger_handle);
-            pcm_device->sound_trigger_handle = 0;
         }
     }
     return 0;
@@ -3657,21 +3585,6 @@ static int in_set_gain(struct audio_stream_in *stream, float gain)
     return 0;
 }
 
-static ssize_t read_bytes_from_dsp(struct stream_in *in, void* buffer,
-                                   size_t bytes)
-{
-    struct pcm_device *pcm_device;
-    struct audio_device *adev = in->dev;
-
-    pcm_device = node_to_item(list_head(&in->pcm_dev_list),
-                              struct pcm_device, stream_list_node);
-
-    if (pcm_device->sound_trigger_handle > 0)
-        return adev->sound_trigger_read_samples(pcm_device->sound_trigger_handle, buffer, bytes);
-    else
-        return 0;
-}
-
 static ssize_t in_read(struct audio_stream_in *stream, void *buffer,
                        size_t bytes)
 {
@@ -3723,21 +3636,15 @@ static ssize_t in_read(struct audio_stream_in *stream, void *buffer,
 false_alarm:
 
     if (!list_empty(&in->pcm_dev_list)) {
-        if (in->usecase == USECASE_AUDIO_CAPTURE_HOTWORD) {
-            bytes = read_bytes_from_dsp(in, buffer, bytes);
-            if (bytes > 0)
-                read_and_process_successful = true;
-        } else {
-            /*
-             * Read PCM and:
-             * - resample if needed
-             * - process if pre-processors are attached
-             * - discard unwanted channels
-             */
-            frames = read_and_process_frames(in, buffer, frames_rq);
-            if (frames >= 0)
-                read_and_process_successful = true;
-        }
+       /*
+        * Read PCM and:
+        * - resample if needed
+        * - process if pre-processors are attached
+        * - discard unwanted channels
+        */
+        frames = read_and_process_frames(in, buffer, frames_rq);
+        if (frames >= 0)
+            read_and_process_successful = true;
     }
 
     /*
@@ -4356,8 +4263,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
                                audio_channel_count_from_in_mask(config->channel_mask)) != 0)
         return -EINVAL;
 
-    usecase_type_t usecase_type = source == AUDIO_SOURCE_HOTWORD ?
-                PCM_HOTWORD_STREAMING : flags & AUDIO_INPUT_FLAG_FAST ?
+    usecase_type_t usecase_type = flags & AUDIO_INPUT_FLAG_FAST ?
                         PCM_CAPTURE_LOW_LATENCY : PCM_CAPTURE;
     pcm_profile = get_pcm_device(usecase_type, devices);
     if (pcm_profile == NULL && usecase_type == PCM_CAPTURE_LOW_LATENCY) {
@@ -4408,11 +4314,7 @@ static int adev_open_input_stream(struct audio_hw_device *dev,
     in->config = pcm_profile->config;
 
     /* Update config params with the requested sample rate and channels */
-    if (source == AUDIO_SOURCE_HOTWORD) {
-        in->usecase = USECASE_AUDIO_CAPTURE_HOTWORD;
-    } else {
-        in->usecase = USECASE_AUDIO_CAPTURE;
-    }
+    in->usecase = USECASE_AUDIO_CAPTURE;
     in->usecase_type = usecase_type;
 
     pthread_mutex_init(&in->lock, (const pthread_mutexattr_t *) NULL);
@@ -4599,33 +4501,6 @@ static int adev_open(const hw_module_t *module, const char *name,
             adev->offload_fx_stop_output =
                         (int (*)(audio_io_handle_t))dlsym(adev->offload_fx_lib,
                                                         "visualizer_hal_stop_output");
-        }
-    }
-
-    if (access(SOUND_TRIGGER_HAL_LIBRARY_PATH, R_OK) == 0) {
-        adev->sound_trigger_lib = dlopen(SOUND_TRIGGER_HAL_LIBRARY_PATH, RTLD_NOW);
-        if (adev->sound_trigger_lib == NULL) {
-            ALOGE("%s: DLOPEN failed for %s", __func__, SOUND_TRIGGER_HAL_LIBRARY_PATH);
-        } else {
-            ALOGV("%s: DLOPEN successful for %s", __func__, SOUND_TRIGGER_HAL_LIBRARY_PATH);
-            adev->sound_trigger_open_for_streaming =
-                        (int (*)(void))dlsym(adev->sound_trigger_lib,
-                                                        "sound_trigger_open_for_streaming");
-            adev->sound_trigger_read_samples =
-                        (size_t (*)(int, void *, size_t))dlsym(adev->sound_trigger_lib,
-                                                        "sound_trigger_read_samples");
-            adev->sound_trigger_close_for_streaming =
-                        (int (*)(int))dlsym(adev->sound_trigger_lib,
-                                                        "sound_trigger_close_for_streaming");
-            if (!adev->sound_trigger_open_for_streaming ||
-                !adev->sound_trigger_read_samples ||
-                !adev->sound_trigger_close_for_streaming) {
-
-                ALOGE("%s: Error grabbing functions in %s", __func__, SOUND_TRIGGER_HAL_LIBRARY_PATH);
-                adev->sound_trigger_open_for_streaming = 0;
-                adev->sound_trigger_read_samples = 0;
-                adev->sound_trigger_close_for_streaming = 0;
-            }
         }
     }
 
